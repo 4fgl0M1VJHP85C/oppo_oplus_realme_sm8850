@@ -1,9 +1,11 @@
-# 纯净 GKI 6.12.23 内核构建（官方 AOSP 源 + 官方 prebuilt 工具链，优先官方、失败回退 cctv18）
+# 纯净 GKI 6.12.38 内核构建（官方 AOSP 源 + 官方 prebuilt 工具链，优先官方、失败回退 cctv18）
 #
 # 目的：只编译官方 GKI 源码，去除所有树外驱动/补丁，并尽量使用官方上游组件。
 #
 # 来源与策略：
-#   内核源码   : github.com/aosp-mirror/kernel_common (pin 82efd984... = android16-6.12-2025-06 / 6.12.23)
+#   内核源码   : github.com/aosp-mirror/kernel_common (pin e72e96ab... = android16-6.12-2025-09 / 6.12.38，KMI gen5)
+#               ★必须与设备固件的 KMI 代际一致：本机为 gen5（uname -r 里 android16-5-g...）。
+#                 gen6 分支（如 2026-03/6.12.69、2025-12/6.12.58）会因符号 CRC 变化导致厂商模块无法加载而卡第一屏。
 #   工具链优先级：
 #     1) 官方 android.googlesource.com prebuilts（pin SHA）
 #        clang      : platform/prebuilts/clang/host/linux-x86   (70a12c4f..., clang-r536225)
@@ -24,10 +26,11 @@
 #      不再使用 aria2c 多连接（那是之前 503 的诱因）。
 
 name: XiaomiGKI6.12.23
+
 env:
   TZ: Asia/Shanghai
   KERNEL_VERSION: '6.12'
-  SUB_VERSION: '23_gki'
+  SUB_VERSION: '38_gki'
   KERNEL_NAME: 'android16-5-ga8f88ad96df3-ab13929693-4k'
 
 on:
@@ -76,11 +79,11 @@ jobs:
           }
           CCTV="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225"
 
-          echo "拉取官方内核源码 (aosp-mirror/kernel_common @ 82efd984, android16-6.12-2025-06 / 6.12.23)..."
-          aria2c -s16 -x16 -k1M "https://github.com/aosp-mirror/kernel_common/archive/82efd98459a2779ae85cb9ee55f9e7b61a31bf7a.zip" -o common.zip \
-            || curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o common.zip "https://github.com/aosp-mirror/kernel_common/archive/82efd98459a2779ae85cb9ee55f9e7b61a31bf7a.zip"
+          echo "拉取官方内核源码 (aosp-mirror/kernel_common @ e72e96ab, android16-6.12-2025-09 / 6.12.38)..."
+          aria2c -s16 -x16 -k1M "https://github.com/aosp-mirror/kernel_common/archive/e72e96ab123527f8fa363a72db7ea63a3318bc76.zip" -o common.zip \
+            || curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o common.zip "https://github.com/aosp-mirror/kernel_common/archive/e72e96ab123527f8fa363a72db7ea63a3318bc76.zip"
           unzip -q common.zip
-          mv "kernel_common-82efd98459a2779ae85cb9ee55f9e7b61a31bf7a" common
+          mv "kernel_common-e72e96ab123527f8fa363a72db7ea63a3318bc76" common
           rm -f common.zip
 
           echo "拉取官方 clang r536225..."
@@ -257,7 +260,7 @@ jobs:
           echo "Commit: $GITHUB_SHA" >> ./ak3.log
           echo "Time: $TIME_NOW" >> ./ak3.log
           echo "Kernel Ver: $FULL_VERSION" >> ./ak3.log
-          echo "Source: aosp-mirror/kernel_common @ 82efd984 (android16-6.12-2025-06 / 6.12.23)" >> ./ak3.log
+          echo "Source: aosp-mirror/kernel_common @ e72e96ab (android16-6.12-2025-09 / 6.12.38)" >> ./ak3.log
           echo "Toolchain: googlesource prebuilts (fallback cctv18) - clang-r536225 / rust 1.82.0 / build-tools" >> ./ak3.log
           echo "Type: Pure GKI (no out-of-tree drivers)" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
@@ -313,7 +316,7 @@ jobs:
           ### 🧩 纯净 GKI ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核 | 构建信息
           - 内核版本号: ${{ env.FULL_VERSION }}
           - 编译时间: ${{ env.TIME_FORM }}
-          - 源码：官方 AOSP GKI 镜像 `aosp-mirror/kernel_common` @ `82efd984`（android16-6.12-2025-06 / 6.12.23）
+          - 源码：官方 AOSP GKI 镜像 `aosp-mirror/kernel_common` @ `e72e96ab`（android16-6.12-2025-09 / 6.12.38）
           - 工具链：优先官方 AOSP prebuilts（clang-r536225 / rust 1.82.0 / kernel build-tools / bindgen），googlesource 不可用时回退 cctv18 同版本二进制
           - 特性：仅编译原始 `gki_defconfig`，无 KernelSU/SUSFS/lz4kd/BBR-Brutal/Droidspaces/ADIOS/Re-Kernel/BBG/KPM 等树外组件
           - 符号 CRC：开启 `KBUILD_GENDWARFKSYMS_STABLE=1` + 路径重映射，匹配原厂 vendor_dlkm
