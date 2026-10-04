@@ -1,14 +1,17 @@
-# 纯净 GKI 6.12.23 内核构建（官方 AOSP 源 + 官方 prebuilt 工具链，全部 pin SHA）
+# 纯净 GKI 6.12.23 内核构建（官方 AOSP 源 + 官方 prebuilt 工具链，优先官方、失败回退 cctv18）
 #
 # 目的：只编译官方 GKI 源码，去除所有树外驱动/补丁，并尽量使用官方上游组件。
 #
-# 上游化清单：
-#   内核源码   : android.googlesource.com/kernel/common          (pin 82efd984... = android16-6.12-2025-06, 6.12.23)
-#   clang      : platform/prebuilts/clang/host/linux-x86        (pin 70a12c4f..., clang-r536225)
-#   rust       : platform/prebuilts/rust                        (pin b9c747ff..., 1.82.0)
-#   build-tools: kernel/prebuilts/build-tools                   (pin 010d8a83..., 含 pahole/dtc/stg/lz4)
-#   bindgen    : platform/prebuilts/clang-tools                 (pin 2e77dab4...)
-#   AnyKernel3 : cctv18/AnyKernel3                              (pin 091ee586...)
+# 来源与策略：
+#   内核源码   : github.com/aosp-mirror/kernel_common (pin 82efd984... = android16-6.12-2025-06 / 6.12.23)
+#   工具链优先级：
+#     1) 官方 android.googlesource.com prebuilts（pin SHA）
+#        clang      : platform/prebuilts/clang/host/linux-x86   (70a12c4f..., clang-r536225)
+#        rust       : platform/prebuilts/rust                    (b9c747ff..., 1.82.0)
+#        build-tools: kernel/prebuilts/build-tools              (010d8a83..., 含 pahole/dtc/stg)
+#        bindgen    : platform/prebuilts/clang-tools            (2e77dab4...)
+#     2) googlesource 下载失败（如 503/限流）时，自动回退 cctv18/oneplus_sm8650_toolchain
+#        的同版本官方二进制转包（clang-r536225 / rust 1.82.0(含 bindgen) / build-tools）
 #
 # 关键点：
 #   1) 显式 export KBUILD_GENDWARFKSYMS_STABLE=1：官方源没有 fork 自带的 _setup_env.sh，
@@ -17,11 +20,10 @@
 #   3) 保留 raw `make gki_defconfig && make Image`（避开 Kleaf/Bazel），只编译原始 gki_defconfig。
 #   4) 已移除 ccache / faketime / 公共 ccache 依赖（构建不再依赖本仓库内任何文件）。
 #
-# 升级方法：改 build.config.constants 的 CLANG_VERSION/RUSTC_VERSION 后，
-#          到对应 googlesource 仓库取该 path 的最新 commit SHA 并替换上方 pin 值即可。
+# 说明：googlesource 的 +archive 端点不支持 HTTP Range，故一律用单连接 curl 串行下载并重试，
+#      不再使用 aria2c 多连接（那是之前 503 的诱因）。
 
 name: XiaomiGKI6.12.23
-
 env:
   TZ: Asia/Shanghai
   KERNEL_VERSION: '6.12'
@@ -46,51 +48,82 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: 安装依赖 + 拉取官方 GKI 源码与官方 prebuilt 工具链（pin SHA）
+      - name: 安装依赖 + 拉取官方 GKI 源码与工具链（官方优先，失败回退 cctv18）
         run: |
+          set -e
           rm -rf kernel_workspace
           mkdir kernel_workspace
           cd kernel_workspace
 
           sudo apt-mark hold firefox
           sudo apt-mark hold libc-bin
-          sudo apt purge -y man-db
+          sudo apt purge -y man-db || true
           sudo rm -rf /var/lib/man-db/auto-update
           sudo apt update
           sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev libdw-dev aria2
 
-          echo "拉取官方内核源码 (kernel/common @ 82efd984, android16-6.12-2025-06 / 6.12.23)..."
-          mkdir -p common &&
-          aria2c -s16 -x16 -k1M "https://android.googlesource.com/kernel/common/+archive/82efd98459a2779ae85cb9ee55f9e7b61a31bf7a.tar.gz" -o common.tar.gz &&
-          tar -xzf common.tar.gz -C common &&
-          rm -f common.tar.gz &
+          # 官方 googlesource +archive：单连接 curl，多次重试（该端点不支持 Range，禁用多连接下载）
+          fetch_gs() {
+            local url="$1" out="$2" i
+            for i in 1 2 3; do
+              if curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 8 --connect-timeout 30 -o "$out" "$url"; then
+                return 0
+              fi
+              echo "googlesource 下载失败(第 $i 次)：$url"
+              sleep 10
+            done
+            return 1
+          }
+          CCTV="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225"
+
+          echo "拉取官方内核源码 (aosp-mirror/kernel_common @ 82efd984, android16-6.12-2025-06 / 6.12.23)..."
+          aria2c -s16 -x16 -k1M "https://github.com/aosp-mirror/kernel_common/archive/82efd98459a2779ae85cb9ee55f9e7b61a31bf7a.zip" -o common.zip \
+            || curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o common.zip "https://github.com/aosp-mirror/kernel_common/archive/82efd98459a2779ae85cb9ee55f9e7b61a31bf7a.zip"
+          unzip -q common.zip
+          mv "kernel_common-82efd98459a2779ae85cb9ee55f9e7b61a31bf7a" common
+          rm -f common.zip
 
           echo "拉取官方 clang r536225..."
-          mkdir -p clang19 &&
-          aria2c -s16 -x16 -k1M "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/70a12c4fe88940ab2b0e6d763492dffa2f07e15a/clang-r536225.tar.gz" -o clang.tar.gz &&
-          tar -xzf clang.tar.gz -C clang19 &&
-          rm -f clang.tar.gz &
+          if fetch_gs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/70a12c4fe88940ab2b0e6d763492dffa2f07e15a/clang-r536225.tar.gz" clang.tar.gz; then
+            mkdir -p clang19 && tar -xzf clang.tar.gz -C clang19 && rm -f clang.tar.gz
+          else
+            echo "googlesource 不可用，回退 cctv18 clang..."
+            curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o clang.zip "$CCTV/clang-r536225.zip"
+            mkdir -p clang19 && unzip -q clang.zip -d clang19 && rm -f clang.zip
+          fi
 
           echo "拉取官方 Rust 1.82.0..."
-          mkdir -p rust &&
-          aria2c -s16 -x16 -k1M "https://android.googlesource.com/platform/prebuilts/rust/+archive/b9c747ff3d3c30c2014b6f94f8599415010ac37f/linux-x86/1.82.0.tar.gz" -o rust.tar.gz &&
-          tar -xzf rust.tar.gz -C rust &&
-          rm -f rust.tar.gz &
+          if fetch_gs "https://android.googlesource.com/platform/prebuilts/rust/+archive/b9c747ff3d3c30c2014b6f94f8599415010ac37f/linux-x86/1.82.0.tar.gz" rust.tar.gz; then
+            mkdir -p rust && tar -xzf rust.tar.gz -C rust && rm -f rust.tar.gz
+          else
+            echo "googlesource 不可用，回退 cctv18 rust..."
+            curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o rust.zip "$CCTV/rust.zip"
+            mkdir -p rust && unzip -q rust.zip -d rust && rm -f rust.zip
+          fi
 
           echo "拉取官方 kernel build-tools (pahole/dtc/stg/lz4 等)..."
-          mkdir -p build-tools &&
-          aria2c -s16 -x16 -k1M "https://android.googlesource.com/kernel/prebuilts/build-tools/+archive/010d8a83d84ced4beef7779453766350db8c08cd/linux-x86.tar.gz" -o build-tools.tar.gz &&
-          tar -xzf build-tools.tar.gz -C build-tools &&
-          rm -f build-tools.tar.gz &
+          if fetch_gs "https://android.googlesource.com/kernel/prebuilts/build-tools/+archive/010d8a83d84ced4beef7779453766350db8c08cd/linux-x86.tar.gz" build-tools.tar.gz; then
+            mkdir -p build-tools && tar -xzf build-tools.tar.gz -C build-tools && rm -f build-tools.tar.gz
+          else
+            echo "googlesource 不可用，回退 cctv18 build-tools..."
+            curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o build-tools.zip "$CCTV/build-tools.zip"
+            unzip -q build-tools.zip && rm -f build-tools.zip
+          fi
 
           echo "拉取官方 bindgen (prebuilts/clang-tools)..."
-          mkdir -p clang-tools &&
-          aria2c -s16 -x16 -k1M "https://android.googlesource.com/platform/prebuilts/clang-tools/+archive/2e77dab4d331387ed8036a3b2ae9fa48ca2f74a4/linux-x86.tar.gz" -o clang-tools.tar.gz &&
-          tar -xzf clang-tools.tar.gz -C clang-tools &&
-          rm -f clang-tools.tar.gz &
+          if fetch_gs "https://android.googlesource.com/platform/prebuilts/clang-tools/+archive/2e77dab4d331387ed8036a3b2ae9fa48ca2f74a4/linux-x86.tar.gz" clang-tools.tar.gz; then
+            mkdir -p clang-tools && tar -xzf clang-tools.tar.gz -C clang-tools && rm -f clang-tools.tar.gz
+          else
+            echo "googlesource 不可用，从 cctv18 rust.zip 提取 bindgen..."
+            if [ ! -x rust/bin/bindgen ]; then
+              curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o rust-fb.zip "$CCTV/rust.zip"
+              mkdir -p rust-fb && unzip -q rust-fb.zip -d rust-fb
+              mkdir -p rust/bin && cp -f rust-fb/bin/bindgen rust/bin/ && chmod +x rust/bin/bindgen
+              rm -rf rust-fb rust-fb.zip
+            fi
+          fi
 
-          wait
-          echo "所有源码及官方 prebuilt 工具链初始化完成！"
+          echo "所有源码及工具链初始化完成！"
 
           echo "正在去除 dirty 后缀..."
           for f in common/scripts/setlocalversion; do
@@ -189,7 +222,8 @@ jobs:
         id: create_zip
         run: |
           cd kernel_workspace
-          aria2c -s8 -x8 -k1M "https://github.com/cctv18/AnyKernel3/archive/091ee586e1a5d5c1c1c957d48fe7c61638d04dc4.zip" -o ak3.zip
+          aria2c -s8 -x8 -k1M "https://github.com/cctv18/AnyKernel3/archive/091ee586e1a5d5c1c1c957d48fe7c61638d04dc4.zip" -o ak3.zip \
+            || curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o ak3.zip "https://github.com/cctv18/AnyKernel3/archive/091ee586e1a5d5c1c1c957d48fe7c61638d04dc4.zip"
           unzip -q ak3.zip
           mv "AnyKernel3-091ee586e1a5d5c1c1c957d48fe7c61638d04dc4" AnyKernel3
           rm -f ak3.zip
@@ -223,8 +257,8 @@ jobs:
           echo "Commit: $GITHUB_SHA" >> ./ak3.log
           echo "Time: $TIME_NOW" >> ./ak3.log
           echo "Kernel Ver: $FULL_VERSION" >> ./ak3.log
-          echo "Source: android.googlesource.com/kernel/common @ 82efd984 (android16-6.12-2025-06 / 6.12.23)" >> ./ak3.log
-          echo "Toolchain: official AOSP prebuilts (clang-r536225 / rust 1.82.0 / build-tools)" >> ./ak3.log
+          echo "Source: aosp-mirror/kernel_common @ 82efd984 (android16-6.12-2025-06 / 6.12.23)" >> ./ak3.log
+          echo "Toolchain: googlesource prebuilts (fallback cctv18) - clang-r536225 / rust 1.82.0 / build-tools" >> ./ak3.log
           echo "Type: Pure GKI (no out-of-tree drivers)" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
@@ -279,8 +313,8 @@ jobs:
           ### 🧩 纯净 GKI ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核 | 构建信息
           - 内核版本号: ${{ env.FULL_VERSION }}
           - 编译时间: ${{ env.TIME_FORM }}
-          - 源码：官方 AOSP GKI `android.googlesource.com/kernel/common` @ `82efd984`（android16-6.12-2025-06 / 6.12.23）
-          - 工具链：官方 AOSP prebuilts（clang-r536225 / rust 1.82.0 / kernel build-tools / bindgen）
+          - 源码：官方 AOSP GKI 镜像 `aosp-mirror/kernel_common` @ `82efd984`（android16-6.12-2025-06 / 6.12.23）
+          - 工具链：优先官方 AOSP prebuilts（clang-r536225 / rust 1.82.0 / kernel build-tools / bindgen），googlesource 不可用时回退 cctv18 同版本二进制
           - 特性：仅编译原始 `gki_defconfig`，无 KernelSU/SUSFS/lz4kd/BBR-Brutal/Droidspaces/ADIOS/Re-Kernel/BBG/KPM 等树外组件
           - 符号 CRC：开启 `KBUILD_GENDWARFKSYMS_STABLE=1` + 路径重映射，匹配原厂 vendor_dlkm
 
