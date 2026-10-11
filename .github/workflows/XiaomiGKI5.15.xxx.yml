@@ -15,6 +15,7 @@
 #      同代内符号 CRC 稳定，原厂厂商模块可加载。
 #   2) 纯 GKI：make gki_defconfig && make Image，不做 6.12 的 gendwarfksyms/路径重映射那套。
 #   3) 编译依赖（clang/、build-tools/、common.zip）用 actions/cache 缓存，首次下载后不再重复拉取。
+#   4) 为规避 runner OOM：改用 Thin LTO（FULL→THIN，CFI 保留、KMI/CRC 不变），并启用 16G swap。
 
 name: XiaomiGKI5.15.xxx
 
@@ -141,6 +142,18 @@ jobs:
           echo "内核版本后缀：$SUFFIX"
           echo "CONFIG_LOCALVERSION=\"-${SUFFIX}\"" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+          # 改用 Thin LTO：大幅降低 LTO 链接内存（OOM 规避）；CFI 照常工作，KMI/符号 CRC 不受影响
+          echo "# CONFIG_LTO_CLANG_FULL is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_LTO_CLANG_THIN=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 启用 16G swap（防 LTO 内存不足）
+        run: |
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl -w vm.swappiness=60 || true
+          free -h
 
       - name: 构建内核
         run: |
