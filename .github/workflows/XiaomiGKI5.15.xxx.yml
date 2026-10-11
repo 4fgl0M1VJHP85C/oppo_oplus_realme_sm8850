@@ -6,8 +6,9 @@
 # 来源：
 #   内核源码 : android.googlesource.com/kernel/common @ d6c8aee0...（分支 android13-5.15-lts / 5.15.220，KMI gen8）
 #              下载走官方单连接 curl+重试；失败自动回退 GitHub 镜像 android13-5.15-lts（5.15.195）
-#   工具链   : clang r450784e（build.config.constants 指定）；build-tools 复用 cctv18（pahole/dtc）
-#              5.15 无 Rust，不需要 rust/bindgen
+#   工具链   : clang r450784e 来自官方 googlesource prebuilts/clang/host/linux-x86（pin ff914350...）
+#              （GitHub 上的同名镜像用 Git LFS，普通 archive 只能拿到 ~130B 的指针文件，故走官方）
+#              build-tools 复用 cctv18（pahole/dtc）；5.15 无 Rust，不需要 rust/bindgen
 #
 # 关键点：
 #   1) KMI gen8 与目标设备固件一致（uname -r 形如 5.15.x-android13-8-...），
@@ -50,7 +51,7 @@ jobs:
             kernel_workspace/build-tools
             kernel_workspace/common.tar.gz
             kernel_workspace/common.zip
-          key: gki515-a13-r450784e-tar-bt-src-d6c8aee0
+          key: gki515-a13-gsc1-r450784e-bt-src-d6c8aee0
 
       - name: 安装依赖 + 拉取 AOSP 官方源码与工具链（命中缓存则跳过）
         run: |
@@ -65,8 +66,7 @@ jobs:
           sudo apt update
           sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev libdw-dev aria2
 
-          CLANGSHA="3ba4f0123411644eb427ec7b353855912b28ab46"
-          CLANGTAR="https://github.com/chongqing-development/android_prebuilts_clang_kernel_linux-x86_clang-r450784e/archive/${CLANGSHA}.tar.gz"
+          CLANGTAR="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/ff91435009921b4252c008869503656bec2b8a9f/clang-r450784e.tar.gz"
           CCTV="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225"
           SRCTAR="https://android.googlesource.com/kernel/common/+archive/d6c8aee048e0871ae3942f60c655c146df22479d.tar.gz"
           SRCZIP="https://github.com/aosp-mirror/kernel_common/archive/refs/heads/android13-5.15-lts.zip"
@@ -75,10 +75,9 @@ jobs:
           if [ -x clang/bin/clang ]; then
             echo "clang r450784e: 命中缓存，跳过下载"
           else
-            echo "拉取 clang r450784e (镜像 tar.gz，保留符号链接)..."
-            curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o clang.tar.gz "$CLANGTAR"
-            tar -xzf clang.tar.gz
-            mv "android_prebuilts_clang_kernel_linux-x86_clang-r450784e-${CLANGSHA}" clang
+            echo "拉取 clang r450784e (官方 googlesource tar.gz，含真实文件与符号链接)..."
+            curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 8 --connect-timeout 30 -o clang.tar.gz "$CLANGTAR"
+            mkdir -p clang && tar -xzf clang.tar.gz -C clang
             rm -f clang.tar.gz
           fi
           # 自检：clang 必须可执行（若符号链接被破坏会在此直接失败，而不是拖到编译阶段）
@@ -129,7 +128,7 @@ jobs:
             kernel_workspace/build-tools
             kernel_workspace/common.tar.gz
             kernel_workspace/common.zip
-          key: gki515-a13-r450784e-tar-bt-src-d6c8aee0
+          key: gki515-a13-gsc1-r450784e-bt-src-d6c8aee0
 
       - name: 添加制作名称
         run: |
