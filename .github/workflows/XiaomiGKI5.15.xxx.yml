@@ -15,7 +15,7 @@
 #   2) 纯 GKI：make gki_defconfig && make Image，不做 6.12 的 gendwarfksyms/路径重映射那套。
 #   3) 编译依赖（clang/、build-tools/、common.zip）用 actions/cache 缓存，首次下载后不再重复拉取。
 
-name: 5.15-android13-8 GKI内核构建（sm8550）
+name: XiaomiGKI5.15.xxx
 
 env:
   TZ: Asia/Shanghai
