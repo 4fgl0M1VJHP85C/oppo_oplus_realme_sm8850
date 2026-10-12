@@ -9,7 +9,7 @@
 #   工具链   : clang r450784e 来自官方 googlesource prebuilts/clang/host/linux-x86（pin ff914350...）
 #              （GitHub 上的同名镜像用 Git LFS，普通 archive 只能拿到 ~130B 的指针文件，故走官方）
 #              build-tools 复用 cctv18（pahole/dtc）；5.15 无 Rust，不需要 rust/bindgen
-#   Root     : BakaSU（Baka-SU/BakaSU）内置进 Image（CONFIG_KSU=y + TP tracepoint hook，无 SUSFS）
+#   Root     : BakaSU（Baka-SU/BakaSU）内置进 Image（CONFIG_KSU=y）+ SUSFS 内联 hook（CONFIG_KSU_SUSFS=y），均编入 Image
 #
 # 关键点：
 #   1) KMI gen8 与目标设备固件一致（uname -r 形如 5.15.x-android13-8-...），
@@ -132,7 +132,7 @@ jobs:
             kernel_workspace/common.zip
           key: gki515-a13-gsc1-r450784e-bt-src-d6c8aee0
 
-      - name: 添加 BakaSU（内置，TP tracepoint hook）
+      - name: 添加 BakaSU（内置）
         run: |
           set -e
           cd kernel_workspace
@@ -140,11 +140,35 @@ jobs:
           CFG=./common/arch/arm64/configs/gki_defconfig
           {
             echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_TRACEPOINT_HOOK=y"
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%"'
           } >> "$CFG"
           grep -q kernelsu ./common/drivers/Makefile && echo "drivers/Makefile 接线 OK"
           grep -q "drivers/kernelsu/Kconfig" ./common/drivers/Kconfig && echo "drivers/Kconfig 接线 OK"
+
+      - name: 应用 SUSFS 补丁（内置）
+        run: |
+          set -e
+          cd kernel_workspace
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu -b gki-android13-5.15
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch ./common/
+          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          cd ./common
+          patch -p1 -F 3 < 50_add_susfs_in_gki-android13-5.15.patch || true
+          CFG=./arch/arm64/configs/gki_defconfig
+          {
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+          } >> "$CFG"
+          ls -l ./fs/susfs.c ./include/linux/susfs.h >/dev/null && echo "SUSFS 源码就位 OK"
 
       - name: 添加制作名称
         run: |
@@ -280,7 +304,7 @@ jobs:
           echo "Source: kernel/common @ d6c8aee0 (android13-5.15-lts / 5.15.220, KMI gen8)" >> ./ak3.log
           echo "Toolchain: clang-r450784e + cctv18 build-tools" >> ./ak3.log
           echo "Type: Pure AOSP GKI (5.15 android13-8, Image only)" >> ./ak3.log
-          echo "Root: BakaSU built-in (TP tracepoint hook)" >> ./ak3.log
+          echo "Root: BakaSU built-in + SUSFS (inline hook)" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
       - name: 上传 ZIP 工件
@@ -337,7 +361,7 @@ jobs:
           - 源码：AOSP 官方 `kernel/common` @ `d6c8aee0`（android13-5.15-lts / 5.15.220，KMI gen8）
           - 工具链：clang-r450784e + cctv18 build-tools
           - 特性：仅编译原始 `gki_defconfig`（纯 AOSP GKI，只出 Image；不含设备 dtbo/dtb/modules）
-          - 内置 Root：BakaSU（TP tracepoint hook，编进 Image，无独立 ko；管理器见 https://github.com/Baka-SU/BakaSU）
+          - 内置 Root：BakaSU + SUSFS（SUSFS 内联 hook，均编进 Image，无独立 ko；管理器见 https://github.com/Baka-SU/BakaSU）
           - 适用：固件 KMI 为 `5.15.x-android13-8` 的 sm8550 设备；AnyKernel 单刷 boot
 
           ### 📋 安装方法 | Installation Guide
