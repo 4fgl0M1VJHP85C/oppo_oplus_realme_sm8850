@@ -1,0 +1,355 @@
+# 纯净 AOSP GKI 5.15.x-android13-8 内核构建（sm8550）
+#
+# 目的：只编译 AOSP 官方 GKI common 源码，产出通用 GKI `Image`，用 AnyKernel 单刷 boot。
+#      不编 dtbo/dtb/modules（那是设备固件 vendor_boot/dtbo 的事）。
+#
+# 来源：
+#   内核源码 : android.googlesource.com/kernel/common @ d6c8aee0...（分支 android13-5.15-lts / 5.15.220，KMI gen8）
+#              下载走官方单连接 curl+重试；失败自动回退 GitHub 镜像 android13-5.15-lts（5.15.195）
+#   工具链   : clang r450784e 来自官方 googlesource prebuilts/clang/host/linux-x86（pin ff914350...）
+#              （GitHub 上的同名镜像用 Git LFS，普通 archive 只能拿到 ~130B 的指针文件，故走官方）
+#              build-tools 复用 cctv18（pahole/dtc）；5.15 无 Rust，不需要 rust/bindgen
+#   Root     : BakaSU（Baka-SU/BakaSU）内置进 Image（CONFIG_KSU=y + TP tracepoint hook，无 SUSFS）
+#
+# 关键点：
+#   1) KMI gen8 与目标设备固件一致（uname -r 形如 5.15.x-android13-8-...），
+#      同代内符号 CRC 稳定，原厂厂商模块可加载。
+#   2) 纯 GKI：make gki_defconfig && make Image，不做 6.12 的 gendwarfksyms/路径重映射那套。
+#   3) 编译依赖（clang/、build-tools/、common.zip）用 actions/cache 缓存，首次下载后不再重复拉取。
+#   4) 为规避 runner OOM：改用 Thin LTO（FULL→THIN，CFI 保留、KMI/CRC 不变），并启用 16G swap。
+
+name: XiaomiGKI5.15.xxxWithBakaSU
+
+env:
+  TZ: Asia/Shanghai
+  KERNEL_VERSION: '5.15'
+  SUB_VERSION: '220_gki'
+  KERNEL_NAME: 'android13-8-g0d58147c2907-ab13729988'
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_suffix:
+        description: '内核后缀(留空默认,开头别加连字符,勿加空格等影响指令运行的保留字符)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      ak3name: ${{ steps.create_zip.outputs.ak3name }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: 恢复编译依赖缓存
+        id: deps-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            kernel_workspace/clang
+            kernel_workspace/build-tools
+            kernel_workspace/common.tar.gz
+            kernel_workspace/common.zip
+          key: gki515-a13-gsc1-r450784e-bt-src-d6c8aee0
+
+      - name: 安装依赖 + 拉取 AOSP 官方源码与工具链（命中缓存则跳过）
+        run: |
+          set -e
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          sudo apt-mark hold firefox
+          sudo apt-mark hold libc-bin
+          sudo apt purge -y man-db || true
+          sudo rm -rf /var/lib/man-db/auto-update
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev libdw-dev aria2
+
+          CLANGTAR="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/ff91435009921b4252c008869503656bec2b8a9f/clang-r450784e.tar.gz"
+          CCTV="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225"
+          SRCTAR="https://android.googlesource.com/kernel/common/+archive/d6c8aee048e0871ae3942f60c655c146df22479d.tar.gz"
+          SRCZIP="https://github.com/aosp-mirror/kernel_common/archive/refs/heads/android13-5.15-lts.zip"
+          SRCZIPDIR="kernel_common-android13-5.15-lts"
+
+          if [ -x clang/bin/clang ]; then
+            echo "clang r450784e: 命中缓存，跳过下载"
+          else
+            echo "拉取 clang r450784e (官方 googlesource tar.gz，含真实文件与符号链接)..."
+            curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 8 --connect-timeout 30 -o clang.tar.gz "$CLANGTAR"
+            mkdir -p clang && tar -xzf clang.tar.gz -C clang
+            rm -f clang.tar.gz
+          fi
+          # 自检：clang 必须可执行（若符号链接被破坏会在此直接失败，而不是拖到编译阶段）
+          if ! ./clang/bin/clang --version >/dev/null 2>&1; then
+            echo "ERROR: ./clang/bin/clang 无法执行，工具链异常（可能符号链接损坏）"
+            exit 1
+          fi
+
+          if [ -x build-tools/bin/pahole ]; then
+            echo "build-tools: 命中缓存，跳过下载"
+          else
+            echo "拉取 build-tools (cctv18, 含 pahole/dtc)..."
+            curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o build-tools.zip "$CCTV/build-tools.zip"
+            unzip -q build-tools.zip && rm -f build-tools.zip
+          fi
+
+          if [ -f common.tar.gz ] || [ -f common.zip ]; then
+            echo "内核源码包: 命中缓存，跳过下载"
+          else
+            echo "拉取 AOSP 官方内核源码 (kernel/common @ android13-5.15-lts / 5.15.220, 单连接重试)..."
+            if curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 8 --connect-timeout 30 -o common.tar.gz "$SRCTAR"; then
+              echo "官方 googlesource 下载成功"
+            else
+              echo "官方 googlesource 失败，回退 GitHub 镜像 (android13-5.15-lts)..."
+              rm -f common.tar.gz
+              aria2c -s16 -x16 -k1M "$SRCZIP" -o common.zip \
+                || curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o common.zip "$SRCZIP"
+            fi
+          fi
+          if [ ! -d common ]; then
+            if [ -f common.tar.gz ]; then
+              mkdir -p common && tar -xzf common.tar.gz -C common
+            else
+              unzip -q common.zip
+              mv "$SRCZIPDIR" common
+            fi
+          fi
+          # 保留 common.tar.gz / common.zip 供缓存复用，不删除
+
+          echo "所有源码及工具链就绪！"
+
+      - name: 保存编译依赖缓存
+        if: steps.deps-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            kernel_workspace/clang
+            kernel_workspace/build-tools
+            kernel_workspace/common.tar.gz
+            kernel_workspace/common.zip
+          key: gki515-a13-gsc1-r450784e-bt-src-d6c8aee0
+
+      - name: 添加 BakaSU（内置，TP tracepoint hook）
+        run: |
+          set -e
+          cd kernel_workspace
+          curl -LSs https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh | bash -s main
+          CFG=./common/arch/arm64/configs/gki_defconfig
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_TRACEPOINT_HOOK=y"
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%"'
+          } >> "$CFG"
+          grep -q kernelsu ./common/drivers/Makefile && echo "drivers/Makefile 接线 OK"
+          grep -q "drivers/kernelsu/Kconfig" ./common/drivers/Kconfig && echo "drivers/Kconfig 接线 OK"
+
+      - name: 添加制作名称
+        run: |
+          cd kernel_workspace
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            SUFFIX="${{ github.event.inputs.kernel_suffix }}"
+          else
+            SUFFIX="${{ env.KERNEL_NAME }}"
+          fi
+          echo "内核版本后缀：$SUFFIX"
+          echo "CONFIG_LOCALVERSION=\"-${SUFFIX}\"" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+          # 改用 Thin LTO：大幅降低 LTO 链接内存（OOM 规避）；CFI 照常工作，KMI/符号 CRC 不受影响
+          echo "# CONFIG_LTO_CLANG_FULL is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_LTO_CLANG_THIN=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 启用额外 swap（best-effort，防 LTO OOM）
+        run: |
+          set +e
+          echo "=== 现有内存/swap ==="
+          free -h
+          swapon --show
+          SWAP=/swapfile-extra
+          sudo swapoff "$SWAP" 2>/dev/null
+          sudo rm -f "$SWAP"
+          if sudo fallocate -l 16G "$SWAP"; then
+            echo "fallocate ok"
+          else
+            echo "fallocate 失败，改用 dd..."
+            sudo dd if=/dev/zero of="$SWAP" bs=1M count=16384 status=none
+          fi
+          if [ -f "$SWAP" ]; then
+            sudo chmod 600 "$SWAP"
+            if sudo mkswap "$SWAP" && sudo swapon "$SWAP"; then
+              echo "额外 swap 已启用: $SWAP"
+            else
+              echo "WARN: 额外 swap 未启用（继续）"
+            fi
+          else
+            echo "WARN: 未创建 swapfile（继续，Thin LTO 一般够用）"
+          fi
+          sudo sysctl -w vm.swappiness=60 || true
+          echo "=== 之后内存/swap ==="
+          free -h
+          swapon --show
+          exit 0
+
+      - name: 构建内核
+        run: |
+          set -e -o pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          CLANG_DIR="$WORKDIR/kernel_workspace/clang/bin"
+          CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
+          LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
+          echo "编译器信息:"
+          echo "Clang版本: $CLANG_VERSION"
+          echo "LLD版本: $LLD_VERSION"
+          pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
+
+          cd kernel_workspace/common
+
+          export HOSTCC=clang
+          export CC=clang
+          export LD=ld.lld
+          export HOSTLD=ld.lld
+          export LLVM=1 LLVM_IAS=1
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export AR=llvm-ar NM=llvm-nm AS=clang READELF=llvm-readelf
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump OBJSIZE=llvm-size STRIP=llvm-strip
+          export KCFLAGS=" -D__ANDROID_COMMON_KERNEL__"
+
+          #在构建内核的同时清除不必要的.NET, Android NDK, Haskell, CodeQL运行库，清理空间且不阻塞后续步骤运行
+          sudo rm -rf /usr/share/dotnet &
+          sudo rm -rf /usr/local/lib/android &
+          sudo rm -rf /opt/ghc &
+          sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out Image
+
+          if [ ! -f ./out/arch/arm64/boot/Image ]; then
+            echo "ERROR: 未生成 out/arch/arm64/boot/Image，构建失败"
+            exit 1
+          fi
+
+          echo "内核编译完成！"
+          echo "编译产物版本:"
+          strings ./out/arch/arm64/boot/Image 2>/dev/null | grep -m1 -E '^5\.15\.[0-9]+' || true
+          echo "编译后空间:"
+          df -h
+
+      - name: 克隆 AnyKernel3 并打包
+        id: create_zip
+        run: |
+          cd kernel_workspace
+          aria2c -s8 -x8 -k1M "https://github.com/cctv18/AnyKernel3/archive/091ee586e1a5d5c1c1c957d48fe7c61638d04dc4.zip" -o ak3.zip \
+            || curl -fL --retry 8 --retry-all-errors --retry-delay 8 -o ak3.zip "https://github.com/cctv18/AnyKernel3/archive/091ee586e1a5d5c1c1c957d48fe7c61638d04dc4.zip"
+          unzip -q ak3.zip
+          mv "AnyKernel3-091ee586e1a5d5c1c1c957d48fe7c61638d04dc4" AnyKernel3
+          rm -f ak3.zip
+          cd AnyKernel3
+          cp ../common/out/arch/arm64/boot/Image ./Image
+          if [[ ! -f ./Image ]]; then
+            echo "未找到内核镜像文件，构建可能出错"
+            exit 1
+          fi
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            AK3_NAME=AnyKernel3_GKI_${{ env.KERNEL_VERSION }}_${{ github.event.inputs.kernel_suffix }}.zip
+          else
+            AK3_NAME=AnyKernel3_GKI_${{ env.KERNEL_VERSION }}_${{ env.KERNEL_NAME }}.zip
+          fi
+          zip -r ../$AK3_NAME ./*
+          echo "ak3name=$AK3_NAME" >> $GITHUB_OUTPUT
+
+          #为AK3添加注释（调试信息）
+          CLEAN_SUB_VERSION="${{ env.SUB_VERSION }}"
+          CLEAN_SUB_VERSION="${CLEAN_SUB_VERSION%_mtk}"
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${CLEAN_SUB_VERSION}-${{ github.event.inputs.kernel_suffix }}
+          else
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${CLEAN_SUB_VERSION}-${{ env.KERNEL_NAME }}
+          fi
+          TIME_NOW="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "Author: $GITHUB_ACTOR" > ./ak3.log
+          echo "Repo: $GITHUB_REPOSITORY" >> ./ak3.log
+          echo "Branch: $GITHUB_REF_NAME" >> ./ak3.log
+          echo "Run ID: $GITHUB_RUN_ID" >> ./ak3.log
+          echo "Commit: $GITHUB_SHA" >> ./ak3.log
+          echo "Time: $TIME_NOW" >> ./ak3.log
+          echo "Kernel Ver: $FULL_VERSION" >> ./ak3.log
+          echo "Source: kernel/common @ d6c8aee0 (android13-5.15-lts / 5.15.220, KMI gen8)" >> ./ak3.log
+          echo "Toolchain: clang-r450784e + cctv18 build-tools" >> ./ak3.log
+          echo "Type: Pure AOSP GKI (5.15 android13-8, Image only)" >> ./ak3.log
+          echo "Root: BakaSU built-in (TP tracepoint hook)" >> ./ak3.log
+          zip -z ../$AK3_NAME < ./ak3.log
+
+      - name: 上传 ZIP 工件
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
+          archive: false
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+
+    steps:
+      - name: 下载 ZIP 工件
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.ak3name }}
+          path: ./release_zips
+          skip-decompress: true
+
+      - name: 设置环境变量
+        run: |
+          CLEAN_SUB_VERSION="${{ env.SUB_VERSION }}"
+          CLEAN_SUB_VERSION="${CLEAN_SUB_VERSION%_mtk}"
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${CLEAN_SUB_VERSION}-${{ github.event.inputs.kernel_suffix }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          else
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${CLEAN_SUB_VERSION}-${{ env.KERNEL_NAME }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          fi
+          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+          TAG_HEAD="GKI-5.15-a13-build"
+          echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
+
+      - name: 创建发布
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > release_notes.md
+          ### 🧩 纯净 AOSP GKI ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核（android13-8）| 构建信息
+          - 内核版本号: ${{ env.FULL_VERSION }}
+          - 编译时间: ${{ env.TIME_FORM }}
+          - 源码：AOSP 官方 `kernel/common` @ `d6c8aee0`（android13-5.15-lts / 5.15.220，KMI gen8）
+          - 工具链：clang-r450784e + cctv18 build-tools
+          - 特性：仅编译原始 `gki_defconfig`（纯 AOSP GKI，只出 Image；不含设备 dtbo/dtb/modules）
+          - 内置 Root：BakaSU（TP tracepoint hook，编进 Image，无独立 ko；管理器见 https://github.com/Baka-SU/BakaSU）
+          - 适用：固件 KMI 为 `5.15.x-android13-8` 的 sm8550 设备；AnyKernel 单刷 boot
+
+          ### 📋 安装方法 | Installation Guide
+          1. 若你的手机已经安装第三方 Recovery（如 TWRP），可进入 Recovery 刷入 AnyKernel 包后重启；
+          2. 若已有 root 权限，可用 [HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases) 刷入并重启；
+          3. 刷入后可用 `dmesg | grep -iE "disagrees about version|Unknown symbol|no symbol version"` 确认厂商模块符号匹配。
+
+          #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用 [KernelFlasher](https://github.com/capntrips/KernelFlasher) 等软件备份 boot 等关键启动分区！※※※
+          EOF
+
+          gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}" \
+            --notes-file release_notes.md \
+            release_zips/AnyKernel3_*.zip
